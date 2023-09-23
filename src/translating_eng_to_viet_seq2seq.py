@@ -44,7 +44,7 @@ length_df.hist(bins = 30)
 plt.show()
 
 max_input_len = 10
-max_target_len = 12
+max_target_len = 13
 
 """Preprocessing (experiemnt: without removing stopwords)"""
 
@@ -76,10 +76,12 @@ from bs4 import BeautifulSoup
 import re
 import nltk
 import spacy
+import string
 from nltk.corpus import stopwords
 nltk.download('stopwords')
 stop_words = set(stopwords.words('english'))
 nlp = spacy.load("en_core_web_sm")
+punctuation_marks = list(string.punctuation)
 
 def clean_english_text(text): # clean a string
   new_text = text.lower()
@@ -100,7 +102,6 @@ def clean_english_text(text): # clean a string
 cleaned_inputs = [clean_english_text(text) for text in input_texts]
 
 import string
-punctuation_marks = list(string.punctuation)
 
 def clean_vietnamese_text(text): # clean a string
   new_text = text.lower()
@@ -118,10 +119,10 @@ def clean_vietnamese_text(text): # clean a string
 
 cleaned_targets = [clean_vietnamese_text(text) for text in target_texts]
 
-cleaned_targets = [line + " <eos>" for line in cleaned_targets]
-cleaned_targets_inputs = ["<sos> " + line for line in cleaned_targets]
+cleaned_targets = ["<sos> " + line + " <eos>" for line in cleaned_targets]
+# cleaned_targets_inputs = ["<sos> " + line for line in cleaned_targets]
 
-for i in range(7000, 7050):
+for i in range(7000, 7015):
   print("Original cleaned: ", cleaned_inputs[i])
   print("Translated cleaned: ", cleaned_targets[i])
   print()
@@ -145,7 +146,7 @@ x_val_seq = x_tokenizer.texts_to_sequences(x_val)
 x_tr_seq = pad_sequences(x_tr_seq, maxlen=max_input_len, padding='post', truncating='post')
 x_val_seq = pad_sequences(x_val_seq, maxlen=max_input_len, padding='post', truncating='post')
 
-x_vocab_size = len(x_tokenizer.word_index)
+x_vocab_size = len(x_tokenizer.word_index) + 1
 
 y_tokenizer = Tokenizer()
 y_tokenizer.fit_on_texts(y_tr)
@@ -156,7 +157,125 @@ y_val_seq = y_tokenizer.texts_to_sequences(y_val)
 y_tr_seq = pad_sequences(y_tr_seq, maxlen=max_target_len, padding='post', truncating='post')
 y_val_seq = pad_sequences(y_val_seq, maxlen=max_target_len, padding='post', truncating='post')
 
-y_vocab_size = len(y_tokenizer.word_index)
+y_vocab_size = len(y_tokenizer.word_index) + 1
 
-"""Building the Model"""
+"""#Building the Model
+
+Encoder
+"""
+
+from keras import backend as K
+K.clear_session()
+
+from keras.models import Sequential, Model
+from keras.layers import Embedding, Dense, LSTM, Concatenate, Input, TimeDistributed
+
+latent_dim = 256
+
+encoder_inputs = Input(shape=(max_input_len, ))
+encoder_embedding = Embedding(input_dim=x_vocab_size, output_dim=latent_dim, trainable=True)
+
+# 1st layer of LSTM
+encoder_lstm_1 = LSTM(units=latent_dim, return_sequences=True, return_state=True)
+encoder_output_1, encoder_state_h_1, encoder_state_c_1 = encoder_lstm_1(encoder_embedding(encoder_inputs))
+
+# 2nd layer of LSTM
+encoder_lstm_2 = LSTM(units=latent_dim, return_sequences=True, return_state=True)
+encoder_output_2, encoder_state_h_2, encoder_state_c_2 = encoder_lstm_2(encoder_output_1)
+
+# 3rd layer of LSTM
+encoder_lstm_3 = LSTM(units=latent_dim, return_sequences=True, return_state=True)
+encoder_output, encoder_state_h, encoder_state_c = encoder_lstm_3(encoder_output_2)
+
+decoder_inputs = Input(shape=(max_target_len - 1, ))
+decoder_embedding = Embedding(input_dim=y_vocab_size, output_dim=latent_dim, trainable=True)
+
+# 1st layer of LSTM
+# 1 layer of LSTM
+decoder_lstm = LSTM(units=latent_dim, return_sequences=True, return_state=True)
+decoder_outputs, _, _ = decoder_lstm(inputs=decoder_embedding(decoder_inputs), initial_state=[encoder_state_h, encoder_state_c])
+
+# decoder_outputs (sequences_lenght, units), each hidden state of each unit in each time step corresponds to a numerical value
+decoder_dense = Dense(units=y_vocab_size, activation='softmax')
+decoder_outputs = decoder_dense(decoder_outputs)
+
+model = Model([encoder_inputs, decoder_inputs], decoder_outputs)
+
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy')
+model.summary()
+
+from keras.callbacks import EarlyStopping
+es = EarlyStopping(monitor='val_loss', mode='min', verbose=1)
+
+history = model.fit([x_tr_seq, y_tr_seq[:,:-1]], y_tr_seq.reshape(y_tr_seq.shape[0], y_tr_seq.shape[1], 1)[:,1:], epochs=80, callbacks=[es], batch_size=256, validation_data=([x_val_seq, y_val_seq[:,:-1]], y_val_seq.reshape(y_val_seq.shape[0], y_val_seq.shape[1], 1)[:,1:]))
+
+import matplotlib.pyplot as plt
+plt.plot(history.history['loss'], label='train')
+plt.plot(history.history['val_loss'], label='test')
+plt.legend()
+plt.show()
+
+model.save('translation_eng_to_viet_seq2seq.h5')
+
+"""Inference"""
+
+# import keras
+# model = keras.models.load_model('translation_eng_to_viet_seq2seq-ver2.h5')
+
+encoder_model = Model(inputs=encoder_inputs, outputs=[encoder_state_h, encoder_state_c])
+
+# decoder input: hidden_states from previous + next word (including <sos>)
+decoder_input_state_h = Input(shape=(latent_dim, ))
+decoder_input_state_c = Input(shape=(latent_dim, ))
+# decoder_hidden_state_input = Input(shape=(max_target_len, latent_dim))
+decoder_hidden_state_input = [decoder_input_state_h, decoder_input_state_c]
+
+decoder_input_single = Input(shape=(1,))
+decoder_input_single_x = decoder_embedding(decoder_input_single)
+# decoder output: hidden states after a timestep
+
+decoder_outputs, decoder_output_state_h, decoder_output_state_c = decoder_lstm(decoder_input_single_x, initial_state=decoder_hidden_state_input)
+decoder_outputs = decoder_dense(decoder_outputs)
+decoder_model = Model(inputs=[decoder_input_single] + decoder_hidden_state_input, outputs=[decoder_outputs] + [decoder_output_state_h, decoder_output_state_c])
+
+decoder_model.summary()
+
+def decode_sequence(input_sequence):
+  en_state_h, en_state_c = encoder_model.predict(input_sequence)
+  target_seq = np.zeros((1, 1))
+
+  target_seq[0, 0] = y_tokenizer.word_index['sos']
+  decoded_sentence = []
+
+  flag = True
+  while flag:
+    # get the probabibliy distribution
+    decoder_out, decoder_out_h, decoder_out_c = decoder_model.predict([target_seq] + [en_state_h, en_state_c])
+
+    max_index = np.argmax(decoder_out[0, 0, :])
+    token = y_tokenizer.index_word[max_index]
+
+    if token != 'eos':
+      decoded_sentence.append(token)
+
+    if token == 'eos' or len(decoded_sentence) >= max_target_len:
+      flag = False
+
+     # update the target sequence (of length 1).
+    target_seq = np.zeros((1,1))
+    target_seq[0, 0] = max_index
+
+    # update internal states
+    en_state_h, en_state_c = decoder_out_h, decoder_out_c
+
+  return ' '.join(decoded_sentence)
+
+def translate(sentence): # already cleaned
+  sentence_tokenized = x_tokenizer.texts_to_sequences([sentence.split()])
+  input_seq = pad_sequences(sentence_tokenized, maxlen=max_input_len, padding='post', truncating='post')
+  print(decode_sequence(input_seq))
+
+x_tokenizer.word_index
+
+translate("she study without coffee")
 
